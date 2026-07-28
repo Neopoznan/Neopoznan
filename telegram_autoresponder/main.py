@@ -40,7 +40,8 @@ def load_config(path: str) -> dict:
     if missing:
         raise ValueError(f"В конфиге {path} не заданы обязательные поля: {missing}")
 
-    config.setdefault("cooldown_seconds", 60)
+    config.setdefault("delay_seconds", 3)
+    config.setdefault("cooldown_seconds", 10 * 60 * 60)
     config.setdefault("dry_run", False)
     return config
 
@@ -57,6 +58,11 @@ def compile_keyword_patterns(keywords: list[str]) -> list[re.Pattern]:
 
 
 def find_matched_keyword(text: str, keywords: list[str], patterns: list[re.Pattern]) -> str | None:
+    """Возвращает первое совпавшее ключевое слово или None.
+
+    Возвращается только одно слово, даже если в сообщении их несколько —
+    этого достаточно, чтобы решить, отправлять ли единственный ответ.
+    """
     if not text:
         return None
     for keyword, pattern in zip(keywords, patterns):
@@ -84,48 +90,67 @@ async def main() -> None:
     patterns = compile_keyword_patterns(keywords)
     chat = config["chat"]
     response_text = config["response_text"]
+    delay_seconds = config["delay_seconds"]
     cooldown_seconds = config["cooldown_seconds"]
     dry_run = config["dry_run"]
 
-    last_sent_at = 0.0
+    # monotonic-время последней "брони" отправки. Резервируется сразу при
+    # срабатывании (до задержки), поэтому cooldown фактически отсчитывается
+    # от момента триггера, а не от фактической отправки — при 3-секундной
+    # задержке и многочасовом cooldown разница не имеет значения, зато это
+    # исключает повторную отправку из-за сообщений, пришедших во время
+    # самой задержки.
+    last_triggered_at = -cooldown_seconds
 
     client = TelegramClient(SESSION_NAME, int(api_id), api_hash)
 
+    async def send_delayed(matched: str, sender_name: str) -> None:
+        await asyncio.sleep(delay_seconds)
+        if dry_run:
+            log.info("[dry_run] Отправка пропущена, response_text=%r", response_text)
+            return
+        await client.send_message(chat, response_text)
+        log.info("Отправлено %r (сработало на %r от %s).", response_text, matched, sender_name)
+
     @client.on(events.NewMessage(chats=chat))
     async def handler(event: events.NewMessage.Event) -> None:
-        nonlocal last_sent_at
+        nonlocal last_triggered_at
 
         # Не реагируем на собственные сообщения, включая ответ бота.
         if event.out:
             return
 
         text = event.raw_text or ""
+        # Даже если в сообщении несколько ключевых слов, find_matched_keyword
+        # вернёт только первое — отправляется не больше одного ответа.
         matched = find_matched_keyword(text, keywords, patterns)
         if not matched:
             return
 
-        sender = await event.get_sender()
-        sender_name = getattr(sender, "username", None) or getattr(sender, "first_name", "unknown")
-
         now = time.monotonic()
-        elapsed = now - last_sent_at
+        elapsed = now - last_triggered_at
         if elapsed < cooldown_seconds:
             log.info(
-                "Совпадение %r от %s проигнорировано: cooldown ещё %.0f сек.",
+                "Совпадение %r проигнорировано: cooldown ещё %.0f сек.",
                 matched,
-                sender_name,
                 cooldown_seconds - elapsed,
             )
             return
 
-        log.info("Совпадение %r от %s -> отправляю ответ.", matched, sender_name)
+        # Бронируем слот немедленно, чтобы сообщения за время задержки
+        # не породили второй ответ.
+        last_triggered_at = now
 
-        if dry_run:
-            log.info("[dry_run] Отправка пропущена, response_text=%r", response_text)
-            return
+        sender = await event.get_sender()
+        sender_name = getattr(sender, "username", None) or getattr(sender, "first_name", "unknown")
 
-        await client.send_message(chat, response_text)
-        last_sent_at = now
+        log.info(
+            "Совпадение %r от %s -> отправлю через %s сек.",
+            matched,
+            sender_name,
+            delay_seconds,
+        )
+        asyncio.create_task(send_delayed(matched, sender_name))
 
     await client.start(phone=phone, password=password)
     me = await client.get_me()
